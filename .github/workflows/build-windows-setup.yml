@@ -1,0 +1,111 @@
+# Builds Gotify Tray++ (seird/gotify-tray-cpp) for Windows, including the Inno Setup installer.
+#
+# Fixes the two causes of the Windows build failures since 2025:
+#  1. install-qt-action@v4 no longer sets the Qt6_DIR environment variable (only
+#     QT_ROOT_DIR), but scripts/build-win.ps1 relies on $env:Qt6_DIR.
+#  2. The runner's default compiler (C:\mingw64, GCC 15, UCRT) does not match the Qt
+#     MinGW binaries (GCC 13.1, msvcrt). The MinGW 13.1 toolchain that ships with Qt
+#     is therefore installed as well and prepended to PATH.
+# Additionally, the build now stops on the first error instead of silently passing an
+# incomplete package on to ISCC.
+
+name: build-windows-setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag/branch/commit of seird/gotify-tray-cpp to build"
+        required: true
+        default: "v0.1.4"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: seird/gotify-tray-cpp
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Qt 6.8.3 + matching MinGW 13.1
+        uses: jurplel/install-qt-action@v4.5.0
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          modules: "qtwebsockets qtimageformats"
+          tools: "tools_mingw1310,qt.tools.win64_mingw1310"
+          dir: ${{ runner.temp }}
+
+      - name: Set Qt6_DIR and verify toolchain
+        shell: pwsh
+        run: |
+          # build-win.ps1 expects the Qt root directory in Qt6_DIR
+          "Qt6_DIR=$env:QT_ROOT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $gpp = (Get-Command g++).Source
+          Write-Host "g++:   $gpp"
+          Write-Host "cmake: $((Get-Command cmake).Source)"
+          Write-Host "ninja: $((Get-Command ninja).Source)"
+          g++ --version
+          if ($gpp -notmatch 'mingw1310') { throw "Wrong compiler in PATH: $gpp" }
+
+      - name: Build + package (scripts/build-win.ps1)
+        shell: pwsh
+        run: |
+          # Fail on any error, including non-zero exit codes of cmake/ninja
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & ./scripts/build-win.ps1
+
+      - name: Verify package (all non-system DLL dependencies present?)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = Resolve-Path package
+          # Dependencies must be located in the application directory itself
+          # (plugins in subdirectories load them from there as well)
+          $have = Get-ChildItem $pkg -Filter *.dll | ForEach-Object { $_.Name.ToLower() }
+          $missing = @()
+          foreach ($f in @("$pkg\gotify-tray++.exe") + (Get-ChildItem $pkg -Recurse -Filter *.dll).FullName) {
+            $deps = objdump -p $f | Select-String 'DLL Name: (.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim().ToLower() }
+            foreach ($d in $deps) {
+              if ($d -match '^(qt6|lib)' -and $have -notcontains $d) { $missing += "$($f.Substring($pkg.Path.Length)) -> $d" }
+            }
+          }
+          if ($missing) { $missing | ForEach-Object { Write-Host "MISSING: $_" }; throw "Package incomplete" }
+          Write-Host "All Qt/MinGW DLLs present."
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $iss = 'scripts/gotify-tray++.iss'
+          # If a version tag was given (e.g. v0.1.5), use it as installer version
+          $ver = '${{ inputs.ref }}' -replace '^v', ''
+          if ($ver -match '^\d+(\.\d+)*$') {
+            (Get-Content $iss) -replace '^#define MyAppVersion ".*"', "#define MyAppVersion `"$ver`"" | Set-Content $iss
+          }
+          Select-String -Path $iss -Pattern '^#define MyAppVersion'
+          iscc $iss
+
+      - name: Upload setup
+        uses: actions/upload-artifact@v7
+        with:
+          name: gotify-tray++-setup_${{ inputs.ref }}
+          path: dist/gotify-tray++-setup.exe
+          if-no-files-found: error
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v7
+        with:
+          name: gotify-tray++-portable_${{ inputs.ref }}
+          path: package/
+          if-no-files-found: error
